@@ -4,6 +4,7 @@ from typing import List, Optional, Sequence, Tuple
 import mip
 import numpy as np
 import torch
+from mip import OptimizationStatus
 from torch import Tensor, nn
 
 
@@ -61,16 +62,22 @@ def find_monotonicity_counterexample(
         # # wx + b_i >= l_i (1 - z_i)
         # m += (-w1 @ x) + (-lower * z) <= b1 - lower
 
-        m.optimize()
+        m.cutoff = 0.0
+        status = m.optimize()
 
         # print(f"Objective: {m.objective_value}, out_weight: {out_weight}")
         if verbose:
             print(f"(out_index, feature_index): {(out_index, feature_index)} Objective: {m.objective_value}")
 
-        if m.objective_value < 0.0:
+        assert (
+            status == OptimizationStatus.OPTIMAL
+            or (m.solver_name == "CBC" and OptimizationStatus.CUTOFF)
+            or (m.solver_name == "GRB" and OptimizationStatus.CUTOFF)
+        )
+        if status == OptimizationStatus.OPTIMAL and m.objective_value < 0.0:
             x_tensor = torch.tensor([x_i.x for x_i in x])
             x_tensor.requires_grad = True
-            (grad,) = torch.autograd.grad(mlp(x_tensor)[1][feature_index], x_tensor)
+            (grad,) = torch.autograd.grad(mlp(x_tensor)[1][out_index], x_tensor)
             grad = grad[feature_index]
             assert grad.item() < 0.0
             return (out_index, feature_index, x_tensor.detach())
@@ -85,7 +92,7 @@ class CertifiedMonotonicNetwork(nn.Module):
         in_size_non_mono: int,
         topology_mono: Sequence[Tuple[int, int]],
         topology_non_mono: Sequence[Tuple[int, int]],
-        first_non_mono_size: Optional[int] = None,
+        compressed_non_mono_size: Optional[int] = None,
     ) -> None:
         super().__init__()
 
@@ -105,37 +112,22 @@ class CertifiedMonotonicNetwork(nn.Module):
         self.mono_mlps: List[TwoLayerPerceptron] = nn.ModuleList()
         self.non_mono_mlps: List[TwoLayerPerceptron] = nn.ModuleList()
 
-        # 最初の1つだけ、non_mono_feature を直ちに mono_feature に concat するのではなく、
-        # non_mono_mlp の hidden に変換してから mono_feature に concat するため特別に処理する
-        hidden_size_non_mono, out_size_non_mono = topology_non_mono[0]
-        hidden_size_mono, out_size_mono = topology_mono[0]
-        self.non_mono_mlps.append(TwoLayerPerceptron(in_size_non_mono, hidden_size_non_mono, out_size_non_mono))
-        if first_non_mono_size is not None:
-            # first_non_mono_size が指定されている場合は、first_non_mono_size に変換してから concat する
-            self.compressor: nn.Module = nn.Linear(hidden_size_non_mono, first_non_mono_size)
-            self.mono_mlps.append(
-                TwoLayerPerceptron(in_size_mono + first_non_mono_size, hidden_size_mono, out_size_mono)
-            )
+        if compressed_non_mono_size is not None:
+            self.compressor: nn.Module = nn.Linear(in_size_non_mono, compressed_non_mono_size)
+            in_size_non_mono = compressed_non_mono_size
         else:
             self.compressor = nn.Identity()
-            self.mono_mlps.append(
-                TwoLayerPerceptron(in_size_mono + hidden_size_non_mono, hidden_size_mono, out_size_mono)
-            )
-        in_size_mono = out_size_mono + out_size_non_mono
-        in_size_non_mono = out_size_non_mono
 
         for (hidden_size_mono, out_size_mono), (hidden_size_non_mono, out_size_non_mono) in zip(
-            topology_mono[1:], topology_non_mono[1:]
+            topology_mono, topology_non_mono
         ):
             self.non_mono_mlps.append(TwoLayerPerceptron(in_size_non_mono, hidden_size_non_mono, out_size_non_mono))
-            self.mono_mlps.append(TwoLayerPerceptron(in_size_mono, hidden_size_mono, out_size_mono))
-            in_size_mono = out_size_mono + out_size_non_mono
+            self.mono_mlps.append(TwoLayerPerceptron(in_size_mono + in_size_non_mono, hidden_size_mono, out_size_mono))
+            in_size_mono = out_size_non_mono
             in_size_non_mono = out_size_non_mono
 
     def forward(self, mono_feature: Tensor, non_mono_feature: Tensor) -> Tensor:
-        mono_mlp, non_mono_mlp = self.mono_mlps[0], self.non_mono_mlps[0]
-        hidden, non_mono_feature = non_mono_mlp(non_mono_feature)
-        mono_feature = mono_mlp(torch.cat([mono_feature, self.compressor(hidden)], dim=-1).clamp(0, 1))[1]
+        non_mono_feature = self.compressor(non_mono_feature)
 
         for mono_mlp, non_mono_mlp in zip(self.mono_mlps[1:], self.non_mono_mlps[1:]):
             mono_feature = mono_mlp(torch.cat([mono_feature, non_mono_feature], dim=-1).clamp(0, 1))[1]
@@ -145,7 +137,7 @@ class CertifiedMonotonicNetwork(nn.Module):
         out[..., : mono_feature.shape[-1]] += mono_feature
         return out
 
-    def certify(self, verbose: bool = True) -> bool:
+    def certify(self, verbose: bool = False) -> bool:
         in_size_mono = self.in_size_mono
         for mlp in self.mono_mlps:
             ce = find_monotonicity_counterexample(mlp, in_size_mono, verbose)
@@ -154,33 +146,11 @@ class CertifiedMonotonicNetwork(nn.Module):
             in_size_mono = mlp.fc_out.out_features
         return True
 
-    # def sample_regularizer(self, batch_size: int, offset: float = 0.2) -> Tensor:
-    #     in_size_mono = self.in_size_mono
-    #     device = next(iter(self.parameters())).device
-
-    #     R = 0.0
-    #     for mlp in self.mono_mlps:
-    #         mono_feature = torch.rand((batch_size, in_size_mono), device=device)
-    #         mono_feature.requires_grad = True
-    #         non_mono_feature = torch.rand((batch_size, mlp.fc_in.in_features - in_size_mono), device=device)
-    #         out = mlp(torch.cat([mono_feature, non_mono_feature], dim=1))[1]
-    #         for out_index in range(out.shape[1]):
-    #             (grad,) = torch.autograd.grad(
-    #                 out[:, out_index].sum(), mono_feature, create_graph=True, retain_graph=True
-    #             )
-    #             R += ((offset + -grad).relu() ** 2).mean() / out.shape[1]
-
-    #         in_size_mono = out.shape[1]
-
-    #     return R
-
     def sample_regularizer(self, batch_size: int, offset: float = 0.2) -> Tensor:
-        # 著者実装が mean じゃなくて max をとっているので真似てみる
-        # https://github.com/gnobitab/CertifiedMonotonicNetwork/blob/main/compas/train.py#L60-L75
         in_size_mono = self.in_size_mono
         device = next(iter(self.parameters())).device
 
-        R = torch.tensor(-np.inf, device=device)
+        R = 0.0
         for mlp in self.mono_mlps:
             mono_feature = torch.rand((batch_size, in_size_mono), device=device)
             mono_feature.requires_grad = True
@@ -190,35 +160,39 @@ class CertifiedMonotonicNetwork(nn.Module):
                 (grad,) = torch.autograd.grad(
                     out[:, out_index].sum(), mono_feature, create_graph=True, retain_graph=True
                 )
-                R_i = torch.max((offset + -grad).relu() ** 2)
-                if R < R_i:
-                    R = R_i
+                R += ((offset + -grad).relu() ** 2).mean() / out.shape[1]
+
             in_size_mono = out.shape[1]
 
         return R
 
 
 if __name__ == "__main__":
+    # ランダムに初期化した場合に False を返すことを確認
+    model = CertifiedMonotonicNetwork(4, 2, [(100, 10), (100, 1)], [(100, 10), (100, 1)])
+    assert not model.certify()
+    print("Passed 1st test!")
+
     # 自明に Monotonic な例で certify がちゃんと True を返すことを確認
     model = CertifiedMonotonicNetwork(4, 2, [(100, 10), (100, 1)], [(100, 10), (100, 1)])
     with torch.no_grad():
         for mlp in model.mono_mlps:
             mlp.fc_in.weight.data.clamp_(min=0)
             mlp.fc_out.weight.data.clamp_(min=0)
-    print(model.certify())  # OK
+    assert model.certify()
+    print("Passed 2nd test!")
 
     # Regularizer で Monotonic にできることを確認
     model = CertifiedMonotonicNetwork(4, 2, [(100, 10), (100, 1)], [(100, 10), (100, 1)])
-    optimizer = torch.optim.Adam(model.parameters())
+    optimizer = torch.optim.Adam(model.parameters(), lr=5e-3)
 
     model.train()
-    for _ in range(10 ** 4):  # 10 ** 5 でもダメだったよ...
+    for _ in range(10 ** 4):
         R = model.sample_regularizer(1024)
-        print(R, end="\r")
         loss = 1e4 * R
         loss.backward()
         optimizer.step()
         optimizer.zero_grad()
 
-    print()
-    print(model.certify())  # ダメ...
+    assert model.certify()
+    print("Passed 3rd test!")
